@@ -22,7 +22,7 @@ class CELEBALoader(object):
             target_transform)
 
         # build the loaders
-        kwargs = {'num_workers': 2, 'pin_memory': True} if use_cuda else {}
+        kwargs = {'num_workers': 8, 'pin_memory': True} if use_cuda else {}
         self.train_loader = create_loader(
             train_dataset,
             train_sampler,
@@ -32,7 +32,7 @@ class CELEBALoader(object):
 
         self.test_loader = create_loader(test_dataset,
                                          test_sampler,
-                                         batch_size,
+                                         256,
                                          shuffle=False,
                                          **kwargs)
         self.output_size = 40

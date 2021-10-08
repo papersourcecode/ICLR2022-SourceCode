@@ -115,7 +115,6 @@ def calculate_fid_from_generated_images(fid_model,
                 continue
             data = data.cuda() if cuda else data
             batch_size = data.size(0)
-            assert fid_model.batch_size <= batch_size
             _, generated, _ = vae.generate_synthetic_samples(batch_size)
 
             ####

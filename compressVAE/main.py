@@ -5,9 +5,7 @@ from numpy import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from copy import deepcopy
 import numpy as np
-from itertools import chain
 
 from models.vae.LVAE import LVAE
 from models.student_teacher import StudentTeacher
@@ -16,13 +14,11 @@ from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
 from helpers.fid import train_fid_model
 from helpers.metrics import calculate_fid
-from helpers.utils import float_type, ones_like, \
-    append_to_csv, num_samples_in_loader, check_or_create_dir, \
-    dummy_context, number_of_parameters
+from helpers.utils import num_samples_in_loader, dummy_context
 from helpers.distributions import set_decoder_std
 import GPUs
 
-parser = argparse.ArgumentParser(description='VAE compression')
+parser = argparse.ArgumentParser(description='compress VAE')
 
 # Task parameters
 parser.add_argument(
@@ -102,10 +98,8 @@ parser.add_argument('--nll-type',
                     type=str,
                     default='gaussian',
                     help='bernoulli or gaussian (default: bernoulli)')
-parser.add_argument('--t-e-arch', type=int, default=1, help='teacher arch')
-parser.add_argument('--t-d-arch', type=int, default=1, help='teacher arch')
-parser.add_argument('--s-e-arch', type=int, default=1, help='teacher arch')
-parser.add_argument('--s-d-arch', type=int, default=1, help='teacher arch')
+parser.add_argument('--t-arch', type=int, default=1, help='teacher arch')
+parser.add_argument('--s-arch', type=int, default=1, help='student arch')
 # Optimization related
 parser.add_argument('--optimizer',
                     type=str,
@@ -142,18 +136,6 @@ parser.add_argument('--distill-z-reduction',
                     type=str,
                     default='mean',
                     help='how to reduce z')
-parser.add_argument('--distill-share-z',
-                    type=int,
-                    default=0,
-                    help='share z instead of noise')
-parser.add_argument('--distill-KL',
-                    type=int,
-                    default=0,
-                    help='use KL instead of WS22')
-parser.add_argument('--mode',
-                    type=str,
-                    default='our',
-                    help='retrain / replay / our')
 
 # Visdom parameters
 parser.add_argument('--visdom-url',
@@ -203,50 +185,6 @@ def build_optimizer(model):
     # filt = filter(lambda p: p.requires_grad, model.parameters())
     # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
     return optim_map[args.optimizer.lower().strip()](model.parameters(),
-                                                     lr=args.lr,
-                                                     weight_decay=1e-4)
-
-
-def build_dec_optimizer(model):
-    optim_map = {
-        "rmsprop": optim.RMSprop,
-        "adam": optim.Adam,
-        "adamnorm": AdamNormGrad,
-        "adadelta": optim.Adadelta,
-        "sgd": optim.SGD,
-        "lbfgs": optim.LBFGS
-    }
-    # filt = filter(lambda p: p.requires_grad, model.parameters())
-    # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
-    return optim_map[args.optimizer.lower().strip()](chain(
-        model.d0.parameters(),
-        model.d1.parameters(),
-        model.d2.parameters(),
-        model.d3.parameters(),
-        model.d4.parameters(),
-    ),
-                                                     lr=args.lr,
-                                                     weight_decay=1e-4)
-
-
-def build_enc_optimizer(model):
-    optim_map = {
-        "rmsprop": optim.RMSprop,
-        "adam": optim.Adam,
-        "adamnorm": AdamNormGrad,
-        "adadelta": optim.Adadelta,
-        "sgd": optim.SGD,
-        "lbfgs": optim.LBFGS
-    }
-    # filt = filter(lambda p: p.requires_grad, model.parameters())
-    # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
-    return optim_map[args.optimizer.lower().strip()](chain(
-        model.u1.parameters(),
-        model.u2.parameters(),
-        model.u3.parameters(),
-        model.u4.parameters(),
-        model.u5.parameters(),
-    ),
                                                      lr=args.lr,
                                                      weight_decay=1e-4)
 
@@ -332,7 +270,6 @@ def execute_graph(epoch,
                   fid_model=None,
                   optimizer=None,
                   prefix='test'):
-    ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
     model.eval()
     if 'train' in prefix:
         model.student.train()
@@ -343,38 +280,30 @@ def execute_graph(epoch,
 
     for data, _ in data_loader:
         if 'train' in prefix:
-            # zero gradients on optimizer
-            # before forward pass
+
             optimizer.zero_grad()
-            # WARM UP
             beta = min((epoch / args.warmup_epoch), 1.0) * args.beta
         else:
             beta = args.beta
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
-            # run the VAE and extract loss
-            # case 1: forward: test / scratch / retrain
-            if 'test' in prefix or model.teacher is None or args.mode == 'retrain':
+
+            if model.teacher is None:
                 data = data.cuda() if args.cuda else data
                 output_map = model(data)
-            # case 2: generative replay: replay
-            elif args.mode == 'replay':
-                output_map = model.generative_replay()
-            # case 3: distill: our
-            elif args.mode == 'our':
+
+            else:
                 output_map = model.distill()
 
             loss_t = model.loss_function(output_map, beta)
 
         if 'train' in prefix:
-            # compute bp and optimize
             loss_t['loss_mean'].backward()
             loss_t['param_norm_mean'] = torch.norm(
                 nn.utils.parameters_to_vector(model.student.parameters()))
             loss_t['grad_norm_mean'] = torch.norm(
                 parameters_grad_to_vector(model.student.parameters()))
             optimizer.step()
-            # print(loss_t['grad_norm_mean'], flush=True)
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
             loss_map = _add_loss_map(loss_map, loss_t)
@@ -393,14 +322,11 @@ def execute_graph(epoch,
                 prefix, epoch, num_samples, str(fid)),
                   flush=True)
 
-        # calculate_IS(model.student, data_loader)
-
     loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     print('{}[Epoch {}][{} samples]: losses {}'.format(prefix, epoch,
                                                        num_samples,
                                                        str(loss_map)),
           flush=True)
-    # plot the test accuracy, loss and images
     if grapher:  # only if grapher is not None
         register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
 
@@ -424,40 +350,9 @@ def execute_graph(epoch,
     return
 
 
-def calculate_IS(vae, data_loader):
-    loss_map = {}
-    with torch.no_grad():
-        for data, _ in data_loader:
-            data = data.cuda() if args.cuda else data
-            IS = vae.importance_sampling_prob(data, 5000)
-            if IS == 999:
-                return
-            loss_map = _add_loss_map(loss_map, {'IS_mean': IS})
-    loss_map = _mean_map(loss_map)
-    print('importance sampling -log probability estimation: {}'.format(
-        loss_map['IS_mean']))
-    return
-
-
-def calculate_recon_err(vae, data_loader):
-    loss_map = {}
-    with torch.no_grad():
-        for data, _ in data_loader:
-            data = data.cuda() if args.cuda else data
-            rec = vae.reconstruct(data)
-            if args.nll_type == 'bernoulli':
-                err = (rec != data).type(torch.float).mean()
-            elif args.nll_type == 'gaussian':
-                pass
-            loss_map = _add_loss_map(loss_map, {'recon_err_mean': err})
-    loss_map = _mean_map(loss_map)
-    return loss_map['recon_err_mean']
-
-
 def generate(vae, grapher):
 
     vae.eval()
-    # random generation
     _, gen, _ = vae.generate_synthetic_samples(args.batch_size)
     gen = torch.clamp(gen, 0, 1)
     grapher.register_single({'generated_samples': gen}, plot_type='imgs')
@@ -480,10 +375,7 @@ def get_model_and_loader():
     # append the image shape to the config & build the VAE
     args.img_shp = loader.img_shp,
 
-    s_vae = LVAE(loader.img_shp,
-                 args.s_e_arch,
-                 args.s_d_arch,
-                 kwargs=vars(args))
+    s_vae = LVAE(loader.img_shp, args.s_arch, kwargs=vars(args))
 
     # resume
     if args.resume_model is not None:
@@ -492,7 +384,6 @@ def get_model_and_loader():
 
     t_vae = None
 
-    # eval mode
     if args.eval_model is not None:
         print("loading eval model {}".format(args.eval_model), flush=True)
         s_vae.load_state_dict(torch.load(args.eval_model), strict=True)
@@ -501,23 +392,18 @@ def get_model_and_loader():
     else:
         # with a teacher
         if args.teacher_model is not None:
-            t_vae = LVAE(loader.img_shp,
-                         args.t_e_arch,
-                         args.t_d_arch,
-                         kwargs=vars(args))
+            t_vae = LVAE(loader.img_shp, args.t_arch, kwargs=vars(args))
             print("loading teacher model {}".format(args.teacher_model),
                   flush=True)
 
             # init t_vae
             t_vae.load_state_dict(torch.load(args.teacher_model), strict=True)
             t_vae.requires_grad_(False)
-
-            if args.mode == 'our':
-                s_vae.u1.requires_grad_(False)
-                s_vae.u2.requires_grad_(False)
-                s_vae.u3.requires_grad_(False)
-                s_vae.u4.requires_grad_(False)
-                s_vae.u5.requires_grad_(False)
+            s_vae.u1.requires_grad_(False)
+            s_vae.u2.requires_grad_(False)
+            s_vae.u3.requires_grad_(False)
+            s_vae.u4.requires_grad_(False)
+            s_vae.u5.requires_grad_(False)
 
     # build the combiner which takes in the VAE as a parameter
     # and projects the latent representation to the output space
@@ -565,7 +451,7 @@ def run(args):
     # build a classifier to use for FID
     fid_model = None
     if args.calculate_fid_with is not None:
-        fid_batch_size = args.batch_size if args.calculate_fid_with == 'conv' else 256
+        fid_batch_size = 256
         fid_model = train_fid_model(args, args.calculate_fid_with,
                                     fid_batch_size)
 
@@ -578,12 +464,6 @@ def run(args):
     else:
         optimizer = build_optimizer(model.student)  # collect our optimizer
 
-        print(
-            "there are {} params with {} elems in the st-model and {} params in the student with {} elems"
-            .format(len(list(model.parameters())), number_of_parameters(model),
-                    len(list(model.student.parameters())),
-                    number_of_parameters(model.student)),
-            flush=True)
         start_epoch = 1
         if args.resume_model is not None:
             start_epoch = args.resume_epoch

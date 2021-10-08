@@ -1,28 +1,15 @@
-seed=1
-task=svhn
-beta=1e-1
-search=6
-sdarch=4
-tseed=1
-mode=our
-dzlambda=1e-3
-uid=student
-
-nohup python main.py --uid $uid \
+nohup python main.py --uid student \
 --gpu-wait 0.5 \
 --calculate-fid-with inceptionv3 \
---task $task \
---mode $mode \
---beta $beta \
---warmup-epoch 100 \
---epochs 200 \
---batch-size 256 \
---distill-z-kl-lambda $dzlambda \
---seed $seed \
---s-e-arch $search \
---s-d-arch $sdarch \
---t-e-arch $search \
---t-d-arch $search \
+--task celeba \
+--beta 1e-1 \
+--warmup-epoch 25 \
+--epochs 50 \
+--batch-size 128 \
+--distill-z-kl-lambda 1e-3 \
+--seed 1 \
+--s-arch 4 \
+--t-arch 6 \
 --teacher-model ./CKPT/teacher-model.pth.tar \
-> ${uid}.out 2>&1 &
+> student.out 2>&1 &
 

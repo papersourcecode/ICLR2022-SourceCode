@@ -5,4 +5,3 @@ torchfile==0.1.0
 torchvision==0.8.2
 visdom==0.1.8.9
 pynvml==11.0.0
-lxml==4.6.3

@@ -1,19 +1,11 @@
-seed=1
-task=svhn
-search=6
-sdarch=6
-beta=1e-1
-uid=teacher
-
-nohup python main.py --uid ${uid} \
+nohup python main.py --uid teacher \
 --gpu-wait 0.5 \
 --calculate-fid-with inceptionv3 \
---task $task \
---beta $beta \
---warmup-epoch 100 \
---epochs 200 \
---batch-size 256 \
---seed $seed \
---s-e-arch $search \
---s-d-arch $sdarch \
-> ${uid}.out 2>&1 &
+--task celeba \
+--beta 1e-1 \
+--warmup-epoch 25 \
+--epochs 50 \
+--batch-size 128 \
+--seed 1 \
+--s-arch 6 \
+> teacher.out 2>&1 &
