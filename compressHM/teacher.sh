@@ -1,13 +1,9 @@
 
-epoch=1000
-uid=teacher
-
-nohup python main.py --uid $uid \
---epochs $epoch \
+nohup python main.py --uid teacher \
+--epochs 1000 \
 --lr 1e-2 \
---mode scratch \
---seed $seed \
->> ${uid}.out 2>&1 &
+--seed 1 \
+>> teacher.out 2>&1 &
 
 
 

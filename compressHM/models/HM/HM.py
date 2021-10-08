@@ -24,7 +24,7 @@ class HM(nn.Module):
         z = 2
         self.infnet = nn.ModuleList([
             nn.Sequential(nn.Linear(2, dim), nn.ReLU(), nn.Linear(dim, z)),
-            nn.Sequential(nn.Linear(z+1, dim), nn.ReLU(), nn.Linear(dim, z)),
+            nn.Sequential(nn.Linear(z + 1, dim), nn.ReLU(), nn.Linear(dim, z)),
             nn.Sequential(nn.Linear(1, dim), nn.ReLU(), nn.Linear(dim, z)),
             nn.Sequential(nn.Linear(z, dim), nn.ReLU(), nn.Linear(dim, z))
         ])
@@ -92,7 +92,7 @@ class HM(nn.Module):
             'muy': [muy1, muy2]
         }
 
-    def generate_local(self, param):
+    def generate_wake(self, param):
         z1, z2, z3, z4 = param['z']
         y1, y2 = param['y']
 
@@ -114,7 +114,7 @@ class HM(nn.Module):
 
         return {'logitz': [l1, l2, l3, l4], 'muy': [muy1, muy2]}
 
-    def generate_our(self, param):
+    def generate_distill(self, param):
         nz1, nz2, nz3, nz4 = param['nz']
         y1, y2 = param['y']
 
@@ -173,7 +173,7 @@ class HM(nn.Module):
 
         return param
 
-    def infer_local(self, param):
+    def infer_sleep(self, param):
         z1, z2, z3, z4 = param['z']
         y1, y2 = param['y']
 
@@ -192,7 +192,7 @@ class HM(nn.Module):
     def wake(self, param):
         param_inf = self.infer(param)
 
-        param_gen = self.generate_local(param_inf)
+        param_gen = self.generate_wake(param_inf)
 
         l1, l2, l3, l4 = param_gen['logitz']
         muy1, muy2 = param_gen['muy']
@@ -214,7 +214,7 @@ class HM(nn.Module):
     def sleep(self):
         param_gen = self.generate()
 
-        param_inf = self.infer_local(param_gen)
+        param_inf = self.infer_sleep(param_gen)
 
         l1, l2, l3, l4 = param_inf['logitz']
         z1, z2, z3, z4 = param_gen['z']

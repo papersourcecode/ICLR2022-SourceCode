@@ -11,14 +11,14 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from models.vae.LVAE import HM
+from models.HM.HM import HM
 from models.student_teacher import StudentTeacher
 from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
 from helpers.utils import number_of_parameters
 import GPUs
 
-parser = argparse.ArgumentParser(description='VAE distillation Pytorch')
+parser = argparse.ArgumentParser(description='compress HM')
 
 # Task parameters
 parser.add_argument(
@@ -28,7 +28,7 @@ parser.add_argument(
     help="add a custom task-specific unique id (default: None)")
 parser.add_argument('--epochs',
                     type=int,
-                    default=4000,
+                    default=1000,
                     metavar='N',
                     help='minimum number of epochs to train (default: 10)')
 
@@ -53,11 +53,7 @@ parser.add_argument('--batch-size',
                     default=272,
                     metavar='N',
                     help='input batch size for training (default: 32)')
-
-parser.add_argument('--mode',
-                    type=str,
-                    default='our',
-                    help='scratch / local / our')
+parser.add_argument('--teacher-model', type=str, default=None, help='help')
 parser.add_argument('--eval', action='store_true', default=False, help='help')
 parser.add_argument('--resume', type=int, default=0, help='help')
 # Visdom parameters
@@ -199,12 +195,11 @@ def _mean_map(loss_map):
     return loss_map
 
 
-def train(epoch, model, gen_optimizer, inf_optimizer, loader, grapher):
+def train(epoch, model, gen_optimizer, inf_optimizer, loader):
     ''' train loop helper '''
     return execute_graph(epoch=epoch,
                          model=model,
                          data_loader=loader,
-                         grapher=grapher,
                          gen_optimizer=gen_optimizer,
                          inf_optimizer=inf_optimizer,
                          prefix='train')
@@ -213,7 +208,6 @@ def train(epoch, model, gen_optimizer, inf_optimizer, loader, grapher):
 def execute_graph(epoch,
                   model,
                   data_loader,
-                  grapher,
                   gen_optimizer=None,
                   inf_optimizer=None,
                   prefix='test'):
@@ -223,14 +217,12 @@ def execute_graph(epoch,
 
         gen_optimizer.zero_grad()
 
-        if args.mode == 'scratch':
+        if args.teacher_model is None:
             loss, loss_z, loss_y = model.wake_student({'y': [y1, y2]})
             loss_map['wake_loss_z_mean'] = loss_z
             loss_map['wake_loss_y_mean'] = loss_y
-        elif args.mode == 'local':
-            loss = model.distill_local()
-        elif args.mode == 'our':
-            loss = model.distill_our()
+        else:
+            loss = model.distill()
 
         loss.backward()
         loss_map['gen_param_norm_mean'] = torch.norm(
@@ -241,7 +233,7 @@ def execute_graph(epoch,
 
         gen_optimizer.step()
 
-        if args.mode == 'scratch':
+        if args.teacher_model is None:
             inf_optimizer.zero_grad()
             loss = model.sleep_student()
 
@@ -259,10 +251,6 @@ def execute_graph(epoch,
                                                        num_samples,
                                                        str(loss_map)),
           flush=True)
-    # plot the test accuracy, loss and images
-    if grapher:  # only if grapher is not None
-        register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
-        grapher.show()
 
     loss_map.clear()
 
@@ -303,7 +291,7 @@ def generate(HM, loader, fname):
 
     plt.subplots_adjust(left=0.16, right=0.96, bottom=0.16, top=0.95)
 
-    plt.savefig('data.pdf')
+    plt.savefig('data.png')
     plt.cla()
 
     param = HM.generate()
@@ -311,12 +299,6 @@ def generate(HM, loader, fname):
     y1 = y1.squeeze().detach().cpu().numpy() * Y1_STD + Y1_MEAN
     y2 = y2.squeeze().detach().cpu().numpy() * Y2_STD + Y2_MEAN
 
-    if args.mode == 'scratch':
-        s = 0.5
-    elif args.mode == 'our':
-        s = 1
-    elif args.mode == 'local':
-        s = 1.5
     s = 0
 
     cmap = sns.cubehelix_palette(start=s, light=0.9, as_cmap=True)
@@ -332,7 +314,7 @@ def generate(HM, loader, fname):
                 clip=((0.5, 6), (30, 105)),
                 levels=10,
                 legend=False)
-    plt.savefig(fname + '.pdf')
+    plt.savefig(fname + '.png')
     plt.cla()
 
 
@@ -341,36 +323,22 @@ def get_model_and_loader():
 
     loader = DataLoader(OFDataset(), batch_size=args.batch_size, shuffle=False)
 
-    if args.mode == 'scratch':
+    if args.teacher_model is None:
         student = HM(2, kwargs=vars(args))
         teacher = None
-    elif args.mode in ('our', 'local'):
+    else:
         student = HM(1, kwargs=vars(args))
         teacher = HM(2, kwargs=vars(args))
 
     student_teacher = StudentTeacher(teacher, student, kwargs=vars(args))
 
-    if args.mode in ('our', 'local'):
-        teacher_fname = os.path.join(args.ckpt_dir,
-                                     'teacher-1000.pth.tar')
+    if args.teacher_model is not None:
+        teacher_fname = os.path.join(args.ckpt_dir, args.teacher_model)
         print("loading teacher model {}".format(teacher_fname), flush=True)
         student_teacher.teacher.load_state_dict(torch.load(teacher_fname),
                                                 strict=True)
 
-    if args.resume != 0:
-        load_fname = os.path.join(
-            args.ckpt_dir, '{}-{}.pth.tar'.format(args.uid, str(args.resume)))
-        print("loading eval model {}".format(load_fname), flush=True)
-        student_teacher.student.load_state_dict(torch.load(load_fname),
-                                                strict=True)
-
-    # build the grapher object
-    grapher = Grapher(env=args.uid,
-                      server=args.visdom_url,
-                      port=args.visdom_port)
-    grapher = None
-
-    return [student_teacher, loader, grapher]
+    return [student_teacher, loader]
 
 
 def set_seed(seed):
@@ -394,7 +362,7 @@ def run(args):
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     # collect our model and data loader
-    model, data_loader, grapher = get_model_and_loader()
+    model, data_loader = get_model_and_loader()
 
     # eval mode
     if args.eval:
@@ -416,25 +384,16 @@ def run(args):
             flush=True)
 
         for epoch in range(args.resume + 1, args.epochs + 1):
-            train(epoch, model, gen_optimizer, inf_optimizer, data_loader,
-                  grapher)
+            train(epoch, model, gen_optimizer, inf_optimizer, data_loader)
             gen_scheduler.step()
             inf_scheduler.step()
             if epoch % 1000 == 0:
-                fname = args.uid + '-' + str(epoch)
+                fname = args.uid
                 generate(model.student, data_loader, fname)
                 save_fname = os.path.join(args.ckpt_dir,
-                                          '{}.pth.tar'.format(fname))
+                                          '{}-model.pth.tar'.format(fname))
                 print("saving model {}...".format(save_fname), flush=True)
                 torch.save(model.student.state_dict(), save_fname)
-
-    if grapher is not None:
-        # dump config to visdom
-        grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(
-            model.student.config),
-                         opts=dict(title="config"))
-
-        grapher.save()  # save the remote visdom graphs
 
 
 if __name__ == "__main__":

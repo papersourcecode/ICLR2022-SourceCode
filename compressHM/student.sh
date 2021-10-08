@@ -1,11 +1,6 @@
-
-
-epoch=1000
-uid=student
-
-nohup python main.py --uid $uid \
---epochs $epoch \
+nohup python main.py --uid student \
+--teacher-model teacher-model.pth.tar \
+--epochs 1000 \
 --lr 1e-2 \
---mode our \
 --seed 1 \
->> ${uid}.out 2>&1 &
+>> student.out 2>&1 &
