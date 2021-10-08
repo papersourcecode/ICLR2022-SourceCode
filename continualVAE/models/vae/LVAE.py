@@ -5,16 +5,14 @@ import torch
 import pprint
 import torch.nn.functional as F
 
-from models.reparameterizers.isotropic_gaussian import IsotropicGaussian
-from helpers.layers import View
-from helpers.distributions import nll, nll_activation, kl_gaussian, kl_gaussian_q_N_0_1, kl_out, nll_gaussian_mu_std, nll_gaussian_N_0_1
+from helpers.distributions import nll, nll_activation, kl_gaussian
 from helpers.utils import float_type
 
 EPS_STD = 1e-6
 
 
 class LVAE(nn.Module):
-    def __init__(self, input_shape, encoder_arch, decoder_arch, **kwargs):
+    def __init__(self, input_shape, arch, **kwargs):
         super(LVAE, self).__init__()
         # grab the meta config and print for
         self.config = kwargs['kwargs']
@@ -23,14 +21,13 @@ class LVAE(nn.Module):
 
         self.input_shape = input_shape
         self.input_chans = input_shape[0]
-        self.out_chans = self.input_chans * 2 if self.config[
-            'nll_type'] == 'gaussian' else self.input_chans
+        self.out_chans = self.input_chans * 2
 
         # build
         arch_dict = {'1': 4, '2': 8, '3': 16, '4': 32, '5': 64, '6': 128}
 
-        self.build_encoder(arch_dict[str(encoder_arch)])
-        self.build_decoder(arch_dict[str(decoder_arch)])
+        self.build_encoder(arch_dict[str(arch)])
+        self.build_decoder(arch_dict[str(arch)])
         if self.config['cuda']:
             self.cuda()
 
@@ -73,9 +70,6 @@ class LVAE(nn.Module):
 
         mu = logits[:, 0:int(feature_size / 2)]
         logvar = logits[:, int(feature_size / 2):]
-        # if self.config['std_exp_activation']:
-        #     std = logvar.mul(0.5).exp_() + EPS_STD
-        # else:
         std = F.softplus(logvar) / 0.6931 + EPS_STD
         return mu, std
 
@@ -94,51 +88,49 @@ class LVAE(nn.Module):
         mu = (mu1 * prec1 + mu2 * prec2) / (prec1 + prec2)
         return mu, std
 
-    def forward(self, x, cond_class):
+    def forward(self, x, condition):
 
         # upward
-        # print(cond_class.shape, cond_class)
-        h, l = self.u1(x, cond_class)
+
+        h, l = self.u1(x, condition)
         um1, uv1 = self.iso_gauss_param(l)
-        h, l = self.u2(h, cond_class)
+        h, l = self.u2(h, condition)
         um2, uv2 = self.iso_gauss_param(l)
-        h, l = self.u3(h, cond_class)
+        h, l = self.u3(h, condition)
         um3, uv3 = self.iso_gauss_param(l)
-        h, l = self.u4(h, cond_class)
+        h, l = self.u4(h, condition)
         um4, uv4 = self.iso_gauss_param(l)
-        h, l = self.u5(h, cond_class)
+        h, l = self.u5(h, condition)
         um5, uv5 = self.iso_gauss_param(l)
 
         # downward
-        l = self.d5(cond_class)
+        l = self.d5(condition)
         l = l[:, :, None, None]
         pm5, pv5 = self.iso_gauss_param(l)
         qm5, qv5 = self.prec_weighted_com(um5, uv5, pm5, pv5)
 
         z5, n5 = self.iso_gauss_sample(qm5, qv5, None)
-        _, l = self.d4(z5, cond_class)
+        _, l = self.d4(z5, condition)
         pm4, pv4 = self.iso_gauss_param(l)
         qm4, qv4 = self.prec_weighted_com(um4, uv4, pm4, pv4)
 
         z4, n4 = self.iso_gauss_sample(qm4, qv4, None)
-        _, l = self.d3(z4, cond_class)
+        _, l = self.d3(z4, condition)
         pm3, pv3 = self.iso_gauss_param(l)
         qm3, qv3 = self.prec_weighted_com(um3, uv3, pm3, pv3)
 
         z3, n3 = self.iso_gauss_sample(qm3, qv3, None)
-        _, l = self.d2(z3, cond_class)
+        _, l = self.d2(z3, condition)
         pm2, pv2 = self.iso_gauss_param(l)
         qm2, qv2 = self.prec_weighted_com(um2, uv2, pm2, pv2)
 
         z2, n2 = self.iso_gauss_sample(qm2, qv2, None)
-        _, l = self.d1(z2, cond_class)
+        _, l = self.d1(z2, condition)
         pm1, pv1 = self.iso_gauss_param(l)
         qm1, qv1 = self.prec_weighted_com(um1, uv1, pm1, pv1)
 
         z1, n1 = self.iso_gauss_sample(qm1, qv1, None)
-        _, logits = self.d0(z1, cond_class)
-
-        # logits = logits.view(batch_size, *self.input_shape)
+        _, logits = self.d0(z1, condition)
 
         params = {
             'q': [(qm1, qv1), (qm2, qv2), (qm3, qv3), (qm4, qv4), (qm5, qv5)],
@@ -147,12 +139,9 @@ class LVAE(nn.Module):
             'noise': [n1, n2, n3, n4, n5]
         }
 
-        # print(qm4.shape, pm4.shape, qm5.shape)
-
         return logits, params
 
     def nelbo(self, x, logits, params, beta):
-        # print(x.max(), x.min(), logits.max(), logits.min(), flush=True)
         elbo_nll = nll(x, logits, self.config['nll_type'])
         kl5 = kl_gaussian(*params['q'][4], *params['p'][4])
         kl4 = kl_gaussian(*params['q'][3], *params['p'][3])
@@ -163,64 +152,47 @@ class LVAE(nn.Module):
         nelbo = elbo_nll + beta * kl
         return nelbo, elbo_nll, kl1, kl2, kl3, kl4, kl5
 
-    def generate_cond_class(self, size, class_begin, class_end):
+    def generate_condition(self, size, continual_step):
 
-        num_class = class_end - class_begin
-        real_size = size // num_class * num_class
-        cond_class = float_type(self.config['cuda'])(real_size, 2).zero_()
+        condition = float_type(self.config['cuda'])(size, 2).zero_()
 
-        # r_list = torch.randint(0, num_class, size)
-        r_list = torch.arange(0, real_size, dtype=torch.long
-                              ) * num_class // real_size + class_begin
-
-        for i in range(len(r_list)):
-            cond_class[i, r_list[i]] = 1
-        return cond_class
+        condition[:, continual_step] = 1
+        return condition
 
     def generate_synthetic_samples(self,
                                    size,
-                                   class_begin,
-                                   class_end,
-                                   z_list=None,
+                                   continual_step,
                                    noise_list=None):
-        if z_list is not None:
-            z1, z2, z3, z4, z5 = z_list
+
         if noise_list is not None:
             n1, n2, n3, n4, n5 = noise_list
         else:
             n1 = n2 = n3 = n4 = n5 = None
 
-        cond_class = self.generate_cond_class(size, class_begin, class_end)
+        condition = self.generate_condition(size, continual_step)
 
-        l = self.d5(cond_class)
+        l = self.d5(condition)
         l = l[:, :, None, None]
         pm5, pv5 = self.iso_gauss_param(l)
 
-        if z_list is None:
-            z5, n5 = self.iso_gauss_sample(pm5, pv5, n5)
-        _, l = self.d4(z5, cond_class)
+        z5, n5 = self.iso_gauss_sample(pm5, pv5, n5)
+        _, l = self.d4(z5, condition)
         pm4, pv4 = self.iso_gauss_param(l)
 
-        if z_list is None:
-            z4, n4 = self.iso_gauss_sample(pm4, pv4, n4)
-        _, l = self.d3(z4, cond_class)
+        z4, n4 = self.iso_gauss_sample(pm4, pv4, n4)
+        _, l = self.d3(z4, condition)
         pm3, pv3 = self.iso_gauss_param(l)
 
-        if z_list is None:
-            z3, n3 = self.iso_gauss_sample(pm3, pv3, n3)
-        _, l = self.d2(z3, cond_class)
+        z3, n3 = self.iso_gauss_sample(pm3, pv3, n3)
+        _, l = self.d2(z3, condition)
         pm2, pv2 = self.iso_gauss_param(l)
 
-        if z_list is None:
-            z2, n2 = self.iso_gauss_sample(pm2, pv2, n2)
-        _, l = self.d1(z2, cond_class)
+        z2, n2 = self.iso_gauss_sample(pm2, pv2, n2)
+        _, l = self.d1(z2, condition)
         pm1, pv1 = self.iso_gauss_param(l)
 
-        if z_list is None:
-            z1, n1 = self.iso_gauss_sample(pm1, pv1, n1)
-        _, logits = self.d0(z1, cond_class)
-
-        # logits = l.view(batch_size, *self.input_shape)
+        z1, n1 = self.iso_gauss_sample(pm1, pv1, n1)
+        _, logits = self.d0(z1, condition)
 
         params = {
             'p': [(pm1, pv1), (pm2, pv2), (pm3, pv3), (pm4, pv4), (pm5, pv5)],
@@ -229,76 +201,6 @@ class LVAE(nn.Module):
         }
 
         return logits, nll_activation(logits, self.config['nll_type']), params
-
-    def reconstruct(self, x):
-        z_logits = self.encoder(x)
-
-        z, _ = self.reparameterizer(z_logits, 0)
-
-        logits = self.decoder(z)
-
-        return nll_activation(logits, self.config['nll_type'], binarize=True)
-
-    def importance_sampling_prob(self, x, num_samples):
-        # upward once
-        h, l = self.u1(x)
-        um1, uv1 = self.iso_gauss_param(l)
-        h, l = self.u2(h)
-        um2, uv2 = self.iso_gauss_param(l)
-        h, l = self.u3(h)
-        um3, uv3 = self.iso_gauss_param(l)
-        h, l = self.u4(h)
-        um4, uv4 = self.iso_gauss_param(l)
-        h, l = self.u5(h)
-        um5, uv5 = self.iso_gauss_param(l)
-
-        # downward many times
-        prob_list = []
-        for sample_index in range(num_samples):
-            # downward
-            qm5, qv5 = um5, uv5
-
-            z5, _ = self.iso_gauss_sample(qm5, qv5)
-            _, l = self.d4(z5)
-            pm4, pv4 = self.iso_gauss_param(l)
-            qm4, qv4 = self.prec_weighted_com(um4, uv4, pm4, pv4)
-
-            z4, _ = self.iso_gauss_sample(qm4, qv4)
-            _, l = self.d3(z4)
-            pm3, pv3 = self.iso_gauss_param(l)
-            qm3, qv3 = self.prec_weighted_com(um3, uv3, pm3, pv3)
-
-            z3, _ = self.iso_gauss_sample(qm3, qv3)
-            _, l = self.d2(z3)
-            pm2, pv2 = self.iso_gauss_param(l)
-            qm2, qv2 = self.prec_weighted_com(um2, uv2, pm2, pv2)
-
-            z2, _ = self.iso_gauss_sample(qm2, qv2)
-            _, l = self.d1(z2)
-            pm1, pv1 = self.iso_gauss_param(l)
-            qm1, qv1 = self.prec_weighted_com(um1, uv1, pm1, pv1)
-
-            z1, _ = self.iso_gauss_sample(qm1, qv1)
-            _, logits = self.d0(z1)
-
-            nlpxz = nll(x, logits, self.config['nll_type'])
-            nlqzx = nll_gaussian_mu_std(z1, qm1, qv1) + nll_gaussian_mu_std(
-                z2, qm2,
-                qv2) + nll_gaussian_mu_std(z3, qm3, qv3) + nll_gaussian_mu_std(
-                    z4, qm4, qv4) + nll_gaussian_mu_std(z5, qm5, qv5)
-
-            nlpz = nll_gaussian_mu_std(z1, pm1, pv1) + nll_gaussian_mu_std(
-                z2, pm2,
-                pv2) + nll_gaussian_mu_std(z3, pm3, pv3) + nll_gaussian_mu_std(
-                    z4, pm4, pv4) + nll_gaussian_N_0_1(z5)
-
-            prob_list.append(torch.exp(-nlpz - nlpxz + nlqzx))
-
-        prob = sum(prob_list)
-        if not torch.all(prob > 0):
-            print('importance sampling -inf occured, too low is the prob')
-            return 999
-        return -torch.log(prob)
 
     def train(self, mode: bool = True):
         res = super().train(mode=mode)

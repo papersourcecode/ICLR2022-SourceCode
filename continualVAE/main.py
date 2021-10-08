@@ -7,21 +7,18 @@ import torch.nn as nn
 import torch.optim as optim
 from copy import deepcopy
 import numpy as np
-from itertools import chain
 
 from models.vae.LVAE import LVAE
 from models.student_teacher import StudentTeacher
-from datasets.loader import get_loader, get_split_data_loaders
+from datasets.loader import get_split_data_loaders
 from helpers.grapher import Grapher
 from helpers.fid import train_fid_model
 from helpers.metrics import calculate_fid
-from helpers.utils import float_type, ones_like, \
-    append_to_csv, num_samples_in_loader, check_or_create_dir, \
-    dummy_context, number_of_parameters
+from helpers.utils import num_samples_in_loader, dummy_context
 from helpers.distributions import set_decoder_std
 import GPUs
 
-parser = argparse.ArgumentParser(description='VAE distillation Pytorch')
+parser = argparse.ArgumentParser(description='continual VAE')
 
 # Task parameters
 parser.add_argument(
@@ -29,13 +26,7 @@ parser.add_argument(
     type=str,
     default="",
     help="add a custom task-specific unique id (default: None)")
-parser.add_argument(
-    '--task',
-    type=str,
-    default="mnist",
-    help="""task to work on (can specify multiple) [mnist / cifar10 /
-                    fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)"""
-)
+parser.add_argument('--task', type=str, default="celeba", help="")
 parser.add_argument('--target-class', type=int, default=0)
 parser.add_argument('--continual-step', type=int, default=0)
 parser.add_argument('--epochs',
@@ -90,23 +81,12 @@ parser.add_argument('--eval-model',
                     type=str,
                     default=None,
                     help='model you are to eval (default: None)')
-parser.add_argument('--resume-model',
-                    type=str,
-                    default=None,
-                    help='model you are to resume (default: None)')
-parser.add_argument('--resume-epoch',
-                    type=int,
-                    default=9999,
-                    help='epoch to begin with')
+
 # Model parameters
 parser.add_argument('--nll-type',
                     type=str,
                     default='gaussian',
                     help='bernoulli or gaussian (default: bernoulli)')
-parser.add_argument('--t-e-arch', type=int, default=5, help='teacher arch')
-parser.add_argument('--t-d-arch', type=int, default=5, help='teacher arch')
-parser.add_argument('--s-e-arch', type=int, default=5, help='teacher arch')
-parser.add_argument('--s-d-arch', type=int, default=5, help='teacher arch')
 # Optimization related
 parser.add_argument('--optimizer',
                     type=str,
@@ -143,20 +123,6 @@ parser.add_argument('--distill-z-reduction',
                     type=str,
                     default='mean',
                     help='how to reduce z')
-parser.add_argument('--distill-share-z',
-                    type=int,
-                    default=0,
-                    help='share z instead of noise')
-parser.add_argument('--bayesian-update',
-                    type=int,
-                    default=0,
-                    help='bayesian update')
-parser.add_argument('--distill-KL',
-                    type=int,
-                    default=0,
-                    help='use KL instead of WS22')
-
-parser.add_argument('--mode', type=str, default='our', help='replay / our')
 
 # Visdom parameters
 parser.add_argument('--visdom-url',
@@ -202,8 +168,7 @@ def build_optimizer(model):
         "sgd": optim.SGD,
         "lbfgs": optim.LBFGS
     }
-    # filt = filter(lambda p: p.requires_grad, model.parameters())
-    # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
+
     return optim_map[args.optimizer.lower().strip()](model.parameters(),
                                                      lr=args.lr,
                                                      weight_decay=1e-4)
@@ -268,26 +233,28 @@ def train(epoch, model, optimizer, loader, grapher):
                          data_loader=loader,
                          grapher=grapher,
                          optimizer=optimizer,
-                         fid_model=None,
                          prefix='train')
 
 
-def test(epoch, model, loader, grapher, fid_model):
-    ''' test loop helper '''
-    return execute_graph(epoch,
-                         model=model,
-                         data_loader=loader,
-                         grapher=grapher,
-                         fid_model=fid_model,
-                         optimizer=None,
-                         prefix='test')
+def test(model, loader, grapher, fid_model, continual_step):
+
+    if fid_model is not None:
+        fid = calculate_fid(fid_model=fid_model,
+                            model=model.student,
+                            continual_step=model.continual_step,
+                            loader=loader,
+                            grapher=grapher,
+                            num_samples=1000,
+                            cuda=args.cuda)
+        print('Generations of {}th dataset after {}th continual step: FID {}'.
+              format(str(model.continual_step), str(continual_step), str(fid)),
+              flush=True)
 
 
 def execute_graph(epoch,
                   model,
                   data_loader,
                   grapher,
-                  fid_model=None,
                   optimizer=None,
                   prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
@@ -301,10 +268,8 @@ def execute_graph(epoch,
 
     for data, _ in data_loader:
         if 'train' in prefix:
-            # zero gradients on optimizer
-            # before forward pass
+
             optimizer.zero_grad()
-            # WARM UP only in first step
             beta = args.beta
             if model.continual_step == 0:
                 beta = min((epoch / args.warmup_epoch), 1.0) * args.beta
@@ -314,14 +279,11 @@ def execute_graph(epoch,
             alpha = args.alpha
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
-            # run the VAE and extract loss
             data = data.cuda() if args.cuda else data
-            if model.continual_step == 0 or 'test' in prefix:
+            if model.continual_step == 0:
                 output_map = model(data)
-            elif args.mode == 'our':
+            else:
                 output_map = model.distill_forward(data)
-            elif args.mode == 'replay':
-                output_map = model.replay_forward(data)
 
             loss_t = model.loss_function(output_map, beta, alpha)
 
@@ -333,34 +295,16 @@ def execute_graph(epoch,
             loss_t['grad_norm_mean'] = torch.norm(
                 parameters_grad_to_vector(model.student.parameters()))
             optimizer.step()
-            # print(loss_t['grad_norm_mean'], flush=True)
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
             loss_map = _add_loss_map(loss_map, loss_t)
             num_samples += data.size(0)
-
-    if epoch % args.fid_interval == 0:
-        # FID
-        if fid_model is not None:
-            fid = calculate_fid(fid_model=fid_model,
-                                model=model.student,
-                                continual_step=model.continual_step,
-                                loader=data_loader,
-                                grapher=grapher,
-                                num_samples=1000,
-                                cuda=args.cuda)
-            print('{}[Epoch {}][{} samples]: FID {}'.format(
-                prefix, epoch, num_samples, str(fid)),
-                  flush=True)
-
-        # calculate_IS(model.student, data_loader)
 
     loss_map = _mean_map(loss_map)  # reduce the map to get actual means
     print('{}[Epoch {}][{} samples]: losses {}'.format(prefix, epoch,
                                                        num_samples,
                                                        str(loss_map)),
           flush=True)
-    # plot the test accuracy, loss and images
     if grapher:  # only if grapher is not None
         register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
 
@@ -375,11 +319,7 @@ def execute_graph(epoch,
                 output_map['distill']['gen_student']
             ]
             img_names += ['generation_teacher', 'generation_student']
-        if 'replay' in output_map.keys():
-            images += [
-                output_map['gen_teacher'], output_map['replay']['x_reconstr']
-            ]
-            img_names += ['generation_teacher', 'replay_reconstructions']
+
         register_images(images, img_names, grapher, prefix=prefix)
         generate(model.student, model.continual_step,
                  grapher)  # generate samples
@@ -388,36 +328,6 @@ def execute_graph(epoch,
     loss_map.clear()
 
     return
-
-
-def calculate_IS(vae, data_loader):
-    loss_map = {}
-    with torch.no_grad():
-        for data, _ in data_loader:
-            data = data.cuda() if args.cuda else data
-            IS = vae.importance_sampling_prob(data, 5000)
-            if IS == 999:
-                return
-            loss_map = _add_loss_map(loss_map, {'IS_mean': IS})
-    loss_map = _mean_map(loss_map)
-    print('importance sampling -log probability estimation: {}'.format(
-        loss_map['IS_mean']))
-    return
-
-
-def calculate_recon_err(vae, data_loader):
-    loss_map = {}
-    with torch.no_grad():
-        for data, _ in data_loader:
-            data = data.cuda() if args.cuda else data
-            rec = vae.reconstruct(data)
-            if args.nll_type == 'bernoulli':
-                err = (rec != data).type(torch.float).mean()
-            elif args.nll_type == 'gaussian':
-                pass
-            loss_map = _add_loss_map(loss_map, {'recon_err_mean': err})
-    loss_map = _mean_map(loss_map)
-    return loss_map['recon_err_mean']
 
 
 NOISE_LIST = None
@@ -431,13 +341,13 @@ def generate(vae, continual_step, grapher):
         # random generation
         _, gen, param = vae.generate_synthetic_samples(args.batch_size,
                                                        generating_step,
-                                                       generating_step + 1,
                                                        noise_list=NOISE_LIST)
         NOISE_LIST = param['noise']
         gen = torch.clamp(gen, 0, 1)
         grapher.register_single(
             {
-                'generated_samples_{}_{}'.format(continual_step, generating_step):
+                'generated_samples_of_{}th_dataset_after_{}th_continual_step'.format(
+                    generating_step, continual_step):
                 gen
             },
             plot_type='imgs')
@@ -449,18 +359,10 @@ def get_model_and_loader():
 
     loaders = get_split_data_loaders(args, args.target_class)
 
-    print("train = ",
-          num_samples_in_loader(loaders[-1].train_loader),
-          " | test = ",
-          num_samples_in_loader(loaders[-1].test_loader),
-          " | shape ",
-          loaders[-1].img_shp,
-          flush=True)
-
     # append the image shape to the config & build the VAE
     args.img_shp = loaders[-1].img_shp
 
-    s_vae = LVAE(args.img_shp, args.s_e_arch, args.s_d_arch, kwargs=vars(args))
+    s_vae = LVAE(args.img_shp, 5, kwargs=vars(args))
 
     t_vae = None
 
@@ -514,35 +416,26 @@ def continual_loop(model, data_loaders, grapher, fid_model, continual_step):
 
     # train mode
     else:
-        if continual_step != 0:
+        if continual_step == 1:
             model.student.load_state_dict(torch.load(
-                os.path.join(
-                    args.ckpt_dir, args.uid +
-                    '-model-{}.pth.tar'.format(continual_step - 1))),
+                os.path.join(args.ckpt_dir,
+                             args.uid + '-model-{}.pth.tar'.format(0))),
                                           strict=True)
 
             model.teacher = deepcopy(model.student)
 
         optimizer = build_optimizer(model.student)  # collect our optimizer
 
-        print(
-            "there are {} params with {} elems in the st-model and {} params in the student with {} elems"
-            .format(len(list(model.parameters())), number_of_parameters(model),
-                    len(list(model.student.parameters())),
-                    number_of_parameters(model.student)),
-            flush=True)
-
         model.continual_step = continual_step
 
-        real_epoch = args.epochs
-        for epoch in range(1, real_epoch + 1):
+        for epoch in range(1, args.epochs + 1):
             train(epoch, model, optimizer,
                   data_loaders[continual_step].train_loader, grapher)
 
         for test_c_s in range(continual_step + 1):
             model.continual_step = test_c_s
-            test(0, model, data_loaders[test_c_s].test_loader, grapher,
-                 fid_model)
+            test(model, data_loaders[test_c_s].test_loader, grapher, fid_model,
+                 continual_step)
 
         # save
         save_fname = os.path.join(

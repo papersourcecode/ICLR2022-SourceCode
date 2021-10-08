@@ -1,13 +1,9 @@
-uid=teacher
-
-nohup python main.py --uid $uid \
+nohup python main.py --uid teacher \
 --gpu-wait 0.8 \
---task mnist \
---mode VIB \
+--task svhn \
 --beta 1e-3 \
---seed 2 \
+--seed 16 \
 --s-arch 1 \
---train-MCsamples 1 \
-> ${uid}.out 2>&1 &
+> teacher.out 2>&1 &
 
 

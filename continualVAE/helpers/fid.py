@@ -6,20 +6,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.model_zoo as model_zoo
 
-from torch.autograd import Variable
-from copy import deepcopy
 from collections import Counter
 from torchvision.models.inception import InceptionA, InceptionB, \
     InceptionC, InceptionD, InceptionE, BasicConv2d, InceptionAux
 
 from optimizers.adamnormgrad import AdamNormGrad
-from datasets.loader import get_loader
 
-from .utils import float_type, check_or_create_dir, num_samples_in_loader
 from .metrics import softmax_accuracy
-from .layers import View, Identity, flatten_layers, EarlyStopping, \
-    BWtoRGB
-from .resnet_models import resnet18
+from .layers import View, BWtoRGB
 
 
 def build_optimizer(model, args):

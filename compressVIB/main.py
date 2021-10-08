@@ -1,27 +1,19 @@
 import os
 import argparse
-import pprint
 from numpy import random
 import torch
 import torch.nn as nn
-from torch.nn.modules import loss
 import torch.optim as optim
-from copy import deepcopy
 import numpy as np
 
-from models.vae.VIB import VIB
+from models.vib.VIB import VIB
 from models.student_teacher import StudentTeacher
 from datasets.loader import get_loader
 from optimizers.adamnormgrad import AdamNormGrad
-from helpers.grapher import Grapher
-from helpers.fid import train_fid_model
-from helpers.metrics import calculate_fid
-from helpers.utils import float_type, ones_like, \
-    append_to_csv, num_samples_in_loader, check_or_create_dir, \
-    dummy_context, number_of_parameters
+from helpers.utils import num_samples_in_loader, dummy_context
 import GPUs
 
-parser = argparse.ArgumentParser(description='VAE distillation Pytorch')
+parser = argparse.ArgumentParser(description='compress VIB')
 
 # Task parameters
 parser.add_argument(
@@ -29,27 +21,10 @@ parser.add_argument(
     type=str,
     default="",
     help="add a custom task-specific unique id (default: None)")
-parser.add_argument(
-    '--task',
-    type=str,
-    default="mnist",
-    help="""task to work on (can specify multiple) [mnist / cifar10 /
-                    fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)"""
-)
-parser.add_argument('--mode',
-                    type=str,
-                    default="VIB",
-                    help="""mode [VIB / dropout / vanilla]""")
-parser.add_argument('--epochs',
-                    type=int,
-                    default=200,
-                    metavar='N',
-                    help='minimum number of epochs to train (default: 10)')
+parser.add_argument('--task', type=str, default="mnist", help="")
+parser.add_argument('--epochs', type=int, default=200, metavar='N', help='')
 
-parser.add_argument('--download',
-                    type=int,
-                    default=1,
-                    help='download dataset from s3 (default: 1)')
+parser.add_argument('--download', type=int, default=1, help='')
 parser.add_argument('--data-dir',
                     type=str,
                     default='../datasets-torchvision',
@@ -66,11 +41,6 @@ parser.add_argument('--teacher-model',
                     type=str,
                     default=None,
                     help='teacher you are going to learn from (default: None)')
-parser.add_argument('--eval-model',
-                    type=str,
-                    default=None,
-                    help='model you are to eval (default: None)')
-
 # Model parameters
 
 parser.add_argument('--t-arch', type=int, default=1, help='teacher arch')
@@ -107,19 +77,11 @@ parser.add_argument('--distill-z-kl-lambda',
                     type=float,
                     default=0.0,
                     help='distill z kl lambda (default: 0.0)')
-parser.add_argument('--distill-share-z',
-                    action='store_true',
-                    default=False,
-                    help='share z instead of noise')
-parser.add_argument('--distill-KL',
-                    action='store_true',
-                    default=False,
-                    help='use KL instead of WS22')
+
 parser.add_argument('--temperature',
                     type=float,
                     default=1.0,
                     help='temperature')
-
 
 # Visdom parameters
 parser.add_argument('--visdom-url',
@@ -166,8 +128,7 @@ def build_optimizer(model):
         "sgd": optim.SGD,
         "lbfgs": optim.LBFGS
     }
-    # filt = filter(lambda p: p.requires_grad, model.parameters())
-    # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
+
     return optim_map[args.optimizer.lower().strip()](model.parameters(),
                                                      lr=args.lr,
                                                      weight_decay=1e-4)
@@ -230,32 +191,25 @@ def _mean_map(loss_map):
     return loss_map
 
 
-def train(epoch, model, optimizer, loader, grapher):
+def train(epoch, model, optimizer, loader):
     ''' train loop helper '''
     return execute_graph(epoch=epoch,
                          model=model,
                          data_loader=loader,
-                         grapher=grapher,
                          optimizer=optimizer,
                          prefix='train')
 
 
-def test(epoch, model, loader, grapher):
+def test(epoch, model, loader):
     ''' test loop helper '''
     return execute_graph(epoch,
                          model=model,
                          data_loader=loader,
-                         grapher=grapher,
                          optimizer=None,
                          prefix='test')
 
 
-def execute_graph(epoch,
-                  model,
-                  data_loader,
-                  grapher,
-                  optimizer=None,
-                  prefix='test'):
+def execute_graph(epoch, model, data_loader, optimizer=None, prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
     model.eval()
     if 'train' in prefix:
@@ -287,7 +241,6 @@ def execute_graph(epoch,
             loss_t['grad_norm_mean'] = torch.norm(
                 parameters_grad_to_vector(model.student.parameters()))
             optimizer.step()
-            # print(loss_t['grad_norm_mean'], flush=True)
 
         with torch.no_grad() if 'train' not in prefix else dummy_context():
             loss_map = _add_loss_map(loss_map, loss_t)
@@ -298,10 +251,6 @@ def execute_graph(epoch,
                                                        num_samples,
                                                        str(loss_map)),
           flush=True)
-    # plot the test accuracy, loss and images
-    if grapher:  # only if grapher is not None
-        register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
-        grapher.show()
 
     metric = loss_map['acc_mean']
     loss_map.clear()
@@ -332,37 +281,23 @@ def get_model_and_loader():
 
     t_vae = None
 
-    # eval mode
-    if args.eval_model is not None:
-        print("loading eval model {}".format(args.eval_model), flush=True)
-        s_vae.load_state_dict(torch.load(args.eval_model), strict=True)
+    # with a teacher
+    if args.teacher_model is not None:
+        t_vae = VIB(loader.img_shp,
+                    loader.output_size,
+                    args.t_arch,
+                    kwargs=vars(args))
+        print("loading teacher model {}".format(args.teacher_model),
+              flush=True)
 
-    # train mode
-    else:
-        # with a teacher
-        if args.teacher_model is not None:
-            t_vae = VIB(loader.img_shp,
-                        loader.output_size,
-                        args.t_arch,
-                        kwargs=vars(args))
-            print("loading teacher model {}".format(args.teacher_model),
-                  flush=True)
+        # init t_vae
+        t_vae.load_state_dict(torch.load(args.teacher_model), strict=True)
 
-            # init t_vae
-            t_vae.load_state_dict(torch.load(args.teacher_model), strict=True)
+        t_vae.requires_grad_(False)
 
-            t_vae.requires_grad_(False)
-
-    # build the combiner which takes in the VAE as a parameter
-    # and projects the latent representation to the output space
     student_teacher = StudentTeacher(t_vae, s_vae, kwargs=vars(args))
 
-    # build the grapher object
-    grapher = Grapher(env=args.uid,
-                      server=args.visdom_url,
-                      port=args.visdom_port)
-
-    return [student_teacher, loader, grapher]
+    return [student_teacher, loader]
 
 
 def set_seed(seed):
@@ -386,44 +321,20 @@ def run(args):
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     # collect our model and data loader
-    model, data_loader, grapher = get_model_and_loader()
+    model, data_loader = get_model_and_loader()
 
-    # eval mode
-    if args.eval_model is not None:
-        print("evaluating model {}...".format(args.eval_model), flush=True)
-        test(0, model, data_loader.test_loader, grapher)
+    optimizer = build_optimizer(model.student)  # collect our optimizer
+    scheduler = build_scheduler(optimizer)
 
-    # train mode
-    else:
-        print("starting main training loop from scratch...", flush=True)
-        optimizer = build_optimizer(model.student)  # collect our optimizer
-        scheduler = build_scheduler(optimizer)
-        print(
-            "there are {} params with {} elems in the st-model and {} params in the student with {} elems"
-            .format(len(list(model.parameters())), number_of_parameters(model),
-                    len(list(model.student.parameters())),
-                    number_of_parameters(model.student)),
-            flush=True)
+    for epoch in range(1, args.epochs + 1):
+        train(epoch, model, optimizer, data_loader.train_loader)
+        metric = test(epoch, model, data_loader.test_loader)
+        scheduler.step()
 
-        # best_metric = -9999
-        for epoch in range(1, args.epochs + 1):
-            train(epoch, model, optimizer, data_loader.train_loader, grapher)
-            metric = test(epoch, model, data_loader.test_loader, grapher)
-            scheduler.step()
+    print("saving model with metric {}...".format(metric), flush=True)
 
-            # if metric > best_metric:
-            #     best_metric = metric
-        print("saving model with metric {}...".format(metric), flush=True)
-
-        save_fname = os.path.join(args.ckpt_dir, args.uid + '-model.pth.tar')
-        torch.save(model.student.state_dict(), save_fname)
-
-    # dump config to visdom
-    grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(
-        model.student.config),
-                     opts=dict(title="config"))
-
-    grapher.save()  # save the remote visdom graphs
+    save_fname = os.path.join(args.ckpt_dir, args.uid + '-model.pth.tar')
+    torch.save(model.student.state_dict(), save_fname)
 
 
 if __name__ == "__main__":
