@@ -1,4 +1,3 @@
-from matplotlib.pyplot import sca
 from torch import nn
 import torch
 from collections import OrderedDict
@@ -65,9 +64,6 @@ class VRNN(nn.Module):
 
     def build(self):
 
-        ###########################
-        #### Feature extractor ####
-        ###########################
         # x
         dic_layers = OrderedDict()
         if len(self.dense_x) == 0:
@@ -101,9 +97,6 @@ class VRNN(nn.Module):
                 dic_layers['activation' + str(n)] = self.activation
         self.feature_extractor_z = nn.Sequential(dic_layers)
 
-        ######################
-        #### Dense layers ####
-        ######################
         # 1. h_t, x_t to z_t (Inference)
         dic_layers = OrderedDict()
         if len(self.dense_hx_z) == 0:
@@ -160,9 +153,6 @@ class VRNN(nn.Module):
         self.mlp_hz_x = nn.Sequential(dic_layers)
         self.gen_linear = nn.Linear(dim_hz_x, self.y_dim)
 
-        ####################
-        #### Recurrence ####
-        ####################
         self.rnn = nn.LSTM(dim_feature_x + dim_feature_z, self.dim_RNN,
                            self.num_RNN)
 
@@ -389,80 +379,7 @@ class VRNN(nn.Module):
             'nz': nz
         }
 
-    def generate_local(self, param):
-        batch_size = self.batch_size
-        seq_len = self.gen_seq_len
-
-        teacher_z = param['z']
-        teacher_z_mean = param['z_mean']
-        teacher_z_logvar = param['z_logvar']
-        teacher_x = param['x']
-        teacher_y = param['y']
-
-        # create variable holders
-        z_mean = torch.zeros((seq_len, batch_size, self.z_dim)).to(self.device)
-        z_logvar = torch.zeros(
-            (seq_len, batch_size, self.z_dim)).to(self.device)
-        y = torch.zeros((seq_len, batch_size, self.y_dim)).to(self.device)
-
-        # init rnn h_0 z_0
-        h_t = torch.zeros(self.num_RNN, batch_size,
-                          self.dim_RNN).to(self.device)
-        c_t = torch.zeros(self.num_RNN, batch_size,
-                          self.dim_RNN).to(self.device)
-
-        # inference and reconsturction
-        for t in range(seq_len):
-            h_t_last = h_t.view(self.num_RNN, 1, batch_size,
-                                self.dim_RNN)[-1, :, :, :]
-            # 1 * B * dim_h
-
-            mean_zt, logvar_zt = self.generation_z(h_t_last)
-            # 1 * B * dim_z
-
-            z_t = teacher_z[t:t + 1, :, :]
-            feature_zt = self.feature_extractor_z(z_t)
-            # 1 * B * dim_fz
-            y_t = self.generation_x(feature_zt, h_t_last)
-            # 1 * B * dim_x
-
-            x_t = teacher_x[t:t + 1, :, :]
-
-            feature_xt = self.feature_extractor_x(x_t)
-            # 1 * B * dim_fx
-
-            h_t, c_t = self.recurrence(feature_xt, feature_zt, h_t, c_t)
-            # num_rnn * B * dim_h
-
-            # record
-            z_mean[t, :, :] = torch.squeeze(mean_zt)
-            z_logvar[t, :, :] = torch.squeeze(logvar_zt)
-            y[t, :, :] = torch.squeeze(y_t)
-
-        # loss
-        loss_kl_x_binary = self.kl_bernoulli(y[:, :, 0],
-                                             nn.Sigmoid()(teacher_y[:, :, 0]))
-        loss_kl_x_binary = loss_kl_x_binary.squeeze()
-        loss_kl_x_gauss = self.kl_gaussian_std(teacher_y[:, :, 1:3], self.STD,
-                                               y[:, :, 1:3], self.STD)
-        loss_kl_x_gauss = torch.sum(loss_kl_x_gauss, dim=2)
-        loss_kl_z = self.kl_gaussian(teacher_z_mean, teacher_z_logvar, z_mean,
-                                     z_logvar)
-        loss_kl_z = torch.sum(loss_kl_z, dim=2)
-
-        loss_kl_x_binary = torch.mean(loss_kl_x_binary)
-        loss_kl_x_gauss = torch.mean(loss_kl_x_gauss)
-        loss_kl_z = torch.mean(loss_kl_z)
-
-        loss = loss_kl_x_binary + loss_kl_x_gauss + loss_kl_z
-
-        return loss, {
-            'loss_kl_x_binary_mean': loss_kl_x_binary,
-            'loss_kl_x_gauss_mean': loss_kl_x_gauss,
-            'loss_kl_z_mean': loss_kl_z
-        }
-
-    def generate_our(self, param):
+    def generate_distill(self, param):
         batch_size = self.batch_size
         seq_len = self.gen_seq_len
 

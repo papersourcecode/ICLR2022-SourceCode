@@ -17,12 +17,7 @@ class StudentTeacher(nn.Module):
     def forward_student(self, x, lengths):
         return self.student.forward(x, lengths)
 
-    def distill_local(self):
+    def distill(self):
         assert self.teacher is not None
         param_teacher = self.teacher.generate(1.0, 0, 1.0)
-        return self.student.generate_local(param_teacher)
-
-    def distill_our(self):
-        assert self.teacher is not None
-        param_teacher = self.teacher.generate(1.0, 0, 1.0)
-        return self.student.generate_our(param_teacher)
+        return self.student.generate_distill(param_teacher)

@@ -19,13 +19,13 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-from models.vae.VRNN import VRNN
+from models.vrnn.VRNN import VRNN
 from models.student_teacher import StudentTeacher
 from helpers.grapher import Grapher
 from helpers.utils import number_of_parameters
 import GPUs
 
-parser = argparse.ArgumentParser(description='VAE distillation Pytorch')
+parser = argparse.ArgumentParser(description='compress VRNN')
 
 # Task parameters
 parser.add_argument(
@@ -63,12 +63,8 @@ parser.add_argument('--batch-size',
 parser.add_argument('--dzlambda', type=float, default=1e-3, help='dzlambda')
 parser.add_argument('--STD', type=float, default=1, metavar='LR', help='STD')
 
-parser.add_argument('--mode',
-                    type=str,
-                    default='our',
-                    help='scratch / local / our')
-parser.add_argument('--eval', action='store_true', default=False, help='help')
-parser.add_argument('--resume', type=int, default=0, help='help')
+parser.add_argument('--teacher-model', type=str, default=None, help='help')
+
 # Visdom parameters
 parser.add_argument('--visdom-url',
                     type=str,
@@ -97,228 +93,18 @@ args = parser.parse_args()
 
 
 def fetch_iamondb(data_path='data'):
-    '''
-    strokes_path = os.path.join(data_path, "lineStrokes")
-    ascii_path = os.path.join(data_path, "ascii")
-    train_files_path = os.path.join(data_path, "train.txt")
-    valid_files_path = os.path.join(data_path, "valid.txt")
 
-    if not os.path.exists(strokes_path) or not os.path.exists(ascii_path):
-        raise ValueError("You must download the data from IAMOnDB, and"
-                         "unpack in %s" % data_path)
-
-    if not os.path.exists(train_files_path) or not os.path.exists(
-            valid_files_path):
-        raise ValueError("Cannot find concatenated train.txt and valid.txt"
-                         "files! See the README in %s" % data_path)
-
-    partial_path = data_path
-    train_names = [
-        f.strip() for f in open(train_files_path, mode='r').readlines()
-    ]
-    valid_names = [
-        f.strip() for f in open(valid_files_path, mode='r').readlines()
-    ]
-
-    def construct_stroke_paths(f):
-
-        primary_dir = f.split("-")[0]
-
-        if f[-1].isalpha():
-            sub_dir = f[:-1]
-        else:
-            sub_dir = f
-
-        files_path = os.path.join(strokes_path, primary_dir, sub_dir)
-
-        #Dash is crucial to obtain correct match!
-        files = fnmatch.filter(os.listdir(files_path), f + "-*.xml")
-        files = [os.path.join(files_path, fi) for fi in files]
-        files = sorted(
-            files, key=lambda x: int(x.split(os.sep)[-1].split("-")[-1][:-4]))
-
-        return files
-
-    def construct_ascii_path(f):
-
-        primary_dir = f.split("-")[0]
-
-        if f[-1].isalpha():
-            sub_dir = f[:-1]
-        else:
-            sub_dir = f
-
-        file_path = os.path.join(ascii_path, primary_dir, sub_dir, f + ".txt")
-
-        return file_path
-
-    def estimate_parameter(X):
-        # X: list of numpy: N * n_points-1 * 2
-        reshaped_X = X[0]
-        for line in X[1:]:
-            reshaped_X = np.concatenate([reshaped_X, line], axis=0)
-
-        m, s = reshaped_X.mean(axis=0), reshaped_X.std(axis=0)
-        return m, s
-
-    train_stroke_files_s = [construct_stroke_paths(f) for f in train_names]
-    valid_stroke_files_s = [construct_stroke_paths(f) for f in valid_names]
-
-    train_ascii_files = [construct_ascii_path(f) for f in train_names]
-    valid_stroke_files = [construct_stroke_paths(f) for f in valid_names]
-
-    '''
     train_npy_x = os.path.join(data_path, "train_npy_x.npy")
-    '''
-    valid_npy_x = os.path.join(partial_path, "valid_npy_x.npy")
-    train_npy_u = os.path.join(partial_path, "train_npy_u.npy")
-    valid_npy_u = os.path.join(partial_path, "valid_npy_u.npy")
 
-    train_set = (train_stroke_files_s, train_ascii_files, train_npy_x,
-                 train_npy_u)
-
-    valid_set = (valid_stroke_files_s, valid_stroke_files, valid_npy_x,
-                 valid_npy_u)
-
-    if 0:  #not os.path.exists(train_npy_x) or not os.path.exists(train_npy_u):
-        for stroke_files_s, ascii_files, npy_x, npy_u in [
-                train_set, valid_set
-        ]:
-            # list of nparray: N * n_points * 3
-            x_set = []
-            u_set = []
-
-            for n in range(len(stroke_files_s)):
-                if n % 100 == 0:
-                    print("Processing file %i of %i" %
-                          (n, len(stroke_files_s)))
-
-                stroke_files = stroke_files_s[n]
-                ascii_file = ascii_files[n]
-
-                with open(ascii_file) as fp:
-                    cleaned = [
-                        t.strip() for t in fp.readlines()
-                        if t != '\r\n' and t != '\n' and t != ' \r\n'
-                    ]
-                    cleaned = [l for l in cleaned if len(l) != 0]
-
-                    # Try using CSR
-                    idx = [n for n, li in enumerate(cleaned)
-                           if li == "CSR:"][0]
-                    cleaned_sub = cleaned[idx + 1:]
-                    corrected_sub = []
-
-                    for li in cleaned_sub:
-                        # Handle edge case with %%%%% meaning new line?
-                        if "%" in li:
-                            print(li)
-                            li2 = re.sub('\%\%+', '%', li).split("%")
-                            li2 = [l.strip() for l in li2]
-                            print(li2)
-                            corrected_sub.extend(li2)
-                        else:
-                            corrected_sub.append(li)
-
-                n_one_hot = 57
-                u = [
-                    np.zeros((len(li), n_one_hot), dtype='int16')
-                    for li in corrected_sub
-                ]
-
-                # A-Z, a-z, space, apostrophe, comma, period
-                charset = list(range(65, 90 + 1)) + list(range(
-                    97, 122 + 1)) + [32, 39, 44, 46]
-                tmap = {k: n + 1 for n, k in enumerate(charset)}
-
-                # 0 for UNK/other
-                tmap[0] = 0
-
-                def tokenize_ind(line):
-
-                    t = [ord(c) if ord(c) in charset else 0 for c in line]
-                    r = [tmap[i] for i in t]
-
-                    return r
-
-                for n, li in enumerate(corrected_sub):
-                    u[n][np.arange(len(li)), tokenize_ind(li)] = 1
-
-                x = []
-
-                for stroke_file in stroke_files:
-                    with open(stroke_file) as fp:
-                        tree = etree.parse(fp)
-                        root = tree.getroot()
-                        # Get all the values from the XML
-                        # 0th index is stroke ID, will become up/down
-                        s = np.array([[
-                            i,
-                            int(Point.attrib['x']),
-                            int(Point.attrib['y'])
-                        ] for StrokeSet in root
-                                      for i, Stroke in enumerate(StrokeSet)
-                                      for Point in Stroke])
-
-                        # flip y axis
-                        s[:, 2] = -s[:, 2]
-
-                        # Get end of stroke points
-                        c = s[1:, 0] != s[:-1, 0]
-                        ci = np.where(c == True)[0]
-                        nci = np.where(c == False)[0]
-
-                        # set pen down
-                        s[0, 0] = 0
-                        s[nci, 0] = 0
-
-                        # set pen up
-                        s[ci, 0] = 1
-                        s[-1, 0] = 1
-                        x.append(s)
-
-                x_set.extend(x)
-                u_set.extend(u)
-
-            raw_X = x_set
-            raw_X0 = []
-            raw_new_X = []
-
-            for item in raw_X:
-                raw_X0.append(item[1:, 0])
-                raw_new_X.append(item[1:, 1:] - item[:-1, 1:])
-
-            # X_mean, X_std = estimate_parameter(raw_new_X)
-            # print(X_mean, X_std)
-            X_mean = np.array([8.17868533, -0.11164117])
-            X_std = np.array([41.95389001, 37.123557])
-
-            new_x = []
-
-            for n in range(len(raw_new_X)):
-                normalized_value = (raw_new_X[n] - X_mean) / X_std
-                new_x.append(
-                    np.concatenate((raw_X0[n][:, None], normalized_value),
-                                   axis=-1).astype('float32'))
-
-            pickle.dump(new_x, open(npy_x, mode="wb"))
-            pickle.dump(u_set, open(npy_u, mode='wb'))
-
-    '''
     train_x = pickle.load(open(train_npy_x, mode="rb"))
-    # valid_x = pickle.load(open(valid_npy_x, mode="rb"))
-    # train_u = pickle.load(open(train_npy_u, mode="rb"))
-    # print(len(train_u), len(train_x))
 
-    return train_x, None
+    return train_x
 
 
 class IAMDataset(Dataset):
     def __init__(self):
         super().__init__()
-        self.x, self.u = fetch_iamondb()
-        # N * n_points_in_line * 3
-        # N * n_ascii * 57
+        self.x = fetch_iamondb()
 
         self.len = len(self.x)
 
@@ -330,9 +116,8 @@ class IAMDataset(Dataset):
             raise IndexError
 
         x = self.x[idx]
-        # u = self.u[idx]
 
-        return torch.tensor(x).cuda()  # , torch.tensor(u).cuda()
+        return torch.tensor(x).cuda()
 
 
 def parameters_grad_to_vector(parameters) -> torch.Tensor:
@@ -411,22 +196,16 @@ def _mean_map(loss_map):
     return loss_map
 
 
-def train(epoch, model, optimizer, loader, grapher):
+def train(epoch, model, optimizer, loader):
     ''' train loop helper '''
     return execute_graph(epoch=epoch,
                          model=model,
                          data_loader=loader,
-                         grapher=grapher,
                          optimizer=optimizer,
                          prefix='train')
 
 
-def execute_graph(epoch,
-                  model,
-                  data_loader,
-                  grapher,
-                  optimizer=None,
-                  prefix='test'):
+def execute_graph(epoch, model, data_loader, optimizer=None, prefix='train'):
 
     loss_t, loss_map, num_samples = {}, {}, 0
 
@@ -439,12 +218,10 @@ def execute_graph(epoch,
         if i % repeat == 0:
             optimizer.zero_grad()
 
-        if args.mode == 'scratch':
+        if args.teacher_model is not None:
+            loss, loss_t = model.distill()
+        else:
             loss, loss_t = model.forward_student(x, lengths)
-        elif args.mode == 'local':
-            loss, loss_t = model.distill_local()
-        elif args.mode == 'our':
-            loss, loss_t = model.distill_our()
 
         loss_repeat = loss / repeat
         loss_repeat.backward()
@@ -473,10 +250,6 @@ def execute_graph(epoch,
                                                        num_samples,
                                                        str(loss_map)),
           flush=True)
-    # plot the test accuracy, loss and images
-    if grapher:  # only if grapher is not None
-        register_plots(loss_map, grapher, epoch=epoch, prefix=prefix)
-        grapher.show()
 
     loss_map.clear()
 
@@ -507,25 +280,20 @@ def plot_lines_iamondb_example(X, x0):
 def generate(VRNN, fname):
     VRNN.eval()
 
-    for vars in [(1.0, 0.0, 1.0), (0.8, 0.0, 1.0)]:
+    param = VRNN.generate(1.0, 0.0, 1.0)
+    lines = param['x'].detach().cpu().numpy()
 
-        scale_z, scale_x, scale_x_binary = vars
-        param = VRNN.generate(scale_z, scale_x, scale_x_binary)
-        lines = param['x'].detach().cpu().numpy()
-
-        for index in range(0, 28, 5):
-            plt.figure(figsize=(5, 4))
-            plt.axis('equal')
-            plt.xticks([])
-            plt.yticks([])
-            plt.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
-            for i in range(5):
-                plot_lines_iamondb_example(
-                    lines[:, i + index, :], np.array([[0, 500,
-                                                       1000 * i + 500]]))
-            plt.savefig('{}-{}-{}-{}-{}.pdf'.format(fname, index, scale_z,
-                                                    scale_x, scale_x_binary))
-            plt.cla()
+    for index in range(0, 28, 5):
+        plt.figure(figsize=(5, 4))
+        plt.axis('equal')
+        plt.xticks([])
+        plt.yticks([])
+        plt.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
+        for i in range(5):
+            plot_lines_iamondb_example(lines[:, i + index, :],
+                                       np.array([[0, 500, 1000 * i + 500]]))
+        plt.savefig('{}-{}.png'.format(fname, index))
+        plt.cla()
 
 
 def get_model_and_loader():
@@ -547,35 +315,22 @@ def get_model_and_loader():
                         drop_last=True,
                         collate_fn=collate_fn)
 
-    if args.mode == 'scratch':
-        student = VRNN(2, kwargs=vars(args))
-        teacher = None
-    elif args.mode in ('our', 'local'):
+    if args.teacher_model is not None:
         student = VRNN(1, kwargs=vars(args))
         teacher = VRNN(2, kwargs=vars(args))
+    else:
+        student = VRNN(2, kwargs=vars(args))
+        teacher = None
 
     student_teacher = StudentTeacher(teacher, student, kwargs=vars(args))
 
-    if args.mode in ('our', 'local'):
-        teacher_fname = os.path.join(args.ckpt_dir, 'teacher-6.pth.tar')
+    if args.teacher_model is not None:
+        teacher_fname = os.path.join(args.ckpt_dir, args.teacher_model)
         print("loading teacher model {}".format(teacher_fname), flush=True)
         student_teacher.teacher.load_state_dict(torch.load(teacher_fname),
                                                 strict=True)
 
-    if args.resume != 0:
-        load_fname = os.path.join(
-            args.ckpt_dir, '{}-{}.pth.tar'.format(args.uid, str(args.resume)))
-        print("loading eval model {}".format(load_fname), flush=True)
-        student_teacher.student.load_state_dict(torch.load(load_fname),
-                                                strict=True)
-
-    # build the grapher object
-    grapher = Grapher(env=args.uid,
-                      server=args.visdom_url,
-                      port=args.visdom_port)
-    # grapher = None
-
-    return [student_teacher, loader, grapher]
+    return [student_teacher, loader]
 
 
 def set_seed(seed):
@@ -599,46 +354,16 @@ def run(args):
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     # collect our model and data loader
-    model, data_loader, grapher = get_model_and_loader()
+    model, data_loader = get_model_and_loader()
 
-    # eval mode
-    if args.eval:
-        fname = './IMAGE/{}-{}-test'.format(args.uid, args.resume)
-        generate(model.student, fname)
+    optimizer = build_optimizer(model.student)
 
-    # train mode
-    else:
-        optimizer = build_optimizer(model.student)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 9999, 0.1)
-        print(
-            "there are {} params with {} elems in the st-model and {} params in the student with {} elems"
-            .format(len(list(model.parameters())), number_of_parameters(model),
-                    len(list(model.student.parameters())),
-                    number_of_parameters(model.student)),
-            flush=True)
+    for epoch in range(1, args.epochs + 1):
+        train(epoch, model, optimizer, data_loader)
 
-        for epoch in range(1, args.resume + 1):
-            scheduler.step()
-
-        for epoch in range(args.resume + 1, args.epochs + 1):
-            train(epoch, model, optimizer, data_loader, grapher)
-            scheduler.step()
-
-            # if epoch % 50 == 0:
-            save_fname = os.path.join(args.ckpt_dir,
-                                      '{}-{}.pth.tar'.format(args.uid, epoch))
-            torch.save(model.student.state_dict(), save_fname)
-            save_fname = os.path.join(
-                args.ckpt_dir, '{}-{}-optim.pth.tar'.format(args.uid, epoch))
-            torch.save(optimizer.state_dict(), save_fname)
-
-    if grapher is not None:
-        # dump config to visdom
-        grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(
-            model.student.config),
-                         opts=dict(title="config"))
-
-        grapher.save()  # save the remote visdom graphs
+        save_fname = os.path.join(
+            args.ckpt_dir, '{}-model.pth.tar'.format(args.uid, epoch))
+        torch.save(model.student.state_dict(), save_fname)
 
 
 if __name__ == "__main__":
